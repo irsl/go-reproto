@@ -89,10 +89,11 @@ message $go_msg_type {
 
 					for my $go_field_name (@{$oneof_names{$go_msg_type}{$oneof_name}}) {
 						my $msgs = $proto_msgs->{$go_field_name};
-						if (scalar @$msgs > 1) {
+						if((!$msgs)||(scalar @$msgs == 0)) {
+							$proto_str .= "	// ERROR: couldn't find annotations for $go_field_name\n";							
+						}
+						elsif (scalar @$msgs > 1) {
 							$proto_str .= "	// TODO: $go_field_name has multiple definitions!\n";
-						} elsif(scalar @$msgs == 0) {
-							$proto_str .= "	// ERROR: couldn't find annotations for $go_field_name\n";
 						}
 						for my $msg (@$msgs) {
 							my $flagprefix = "";

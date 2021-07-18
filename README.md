@@ -10,7 +10,7 @@ Invoke it simply specifying the path to the golang binary and the desired destin
 
 ```
 # ./reproto.pl
-Usage: ./reproto.pl /path/to/go.bin /path/to/destdir at ./reproto.pl line 14.
+Usage: ./reproto.pl /path/to/go.bin /path/to/destdir
 ```
 
 ## Dependencies

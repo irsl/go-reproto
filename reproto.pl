@@ -8,7 +8,7 @@ use Data::Dumper;
 my $gobin_path = shift @ARGV;
 my $destdir_path = shift @ARGV;
 
-die "Usage: $0 /path/to/go.bin /path/to/destdir" if (!$destdir_path);
+die "Usage: $0 /path/to/go.bin /path/to/destdir\n" if (!$destdir_path);
 die "Destination directory $destdir_path must exist" if(!-d $destdir_path);
 
 my $gdb_functions = build_gdb_functions($gobin_path, $destdir_path);
@@ -21,7 +21,7 @@ my $proto_msgs = parse_gobin_for_proto_messages($gobin_buf);
 my $proto_oneofs = parse_gobin_for_oneof_messages($gobin_buf);
 #print Dumper($proto_oneofs);exit;
 
-my $type_hints = disassemble_binary($gobin_path);
+my $type_hints = disassemble_binary($gobin_path, $destdir_path);
 # print Dumper($type_hints); exit;
 
 my $protos = reconstruct_protos($proto_functions, $proto_msgs, $proto_oneofs, $type_hints);
@@ -117,23 +117,30 @@ message $go_msg_type {
 
 			}
 		}
-		if($proto_functions->{$basename}->{rpc}) {
-			# each service method gets a _Handler defined, like:
-			# void google.golang.org/grpc/examples/features/proto/echo._Echo_BidirectionalStreamingEcho_Handler(interface {}, google.golang.org/grpc.ServerStream, error);
-			# in this example, the name of the service is Echo
-			
-			my %svcs;
-			for my $symbol (@{$proto_functions->{$basename}->{rpc}}) {
-				next if($symbol !~ /.+\._([a-zA-Z0-9]+)_(.+)_Handler\(/);
-				push @{$svcs{$1}}, $2;
+		
+		# each service method gets a _Handler defined, like:
+		# void google.golang.org/grpc/examples/features/proto/echo._Echo_BidirectionalStreamingEcho_Handler(interface {}, google.golang.org/grpc.ServerStream, error);
+		# in this example, the name of the service is Echo
+		
+		# Another symbol name that should be identified:
+		# void google3/cloud/build/proto/worker/worker_go_proto._Worker_BuildLog_Handler(context.Context, interface {}, google3/net/rpc/go/rpc.Stream, error);
+
+
+		my %svcs;
+
+		# in some cases, the grpc service definitions are part of the main pg.go file, so we process both msg and rpc
+		my @allsymbols = (@{$proto_functions->{$basename}->{msg} || []}, @{$proto_functions->{$basename}->{rpc} || []});
+		for my $symbol (@allsymbols) {
+			next if($symbol !~ /.+\._([a-zA-Z0-9]+)_(.+)_Handler\(/);
+			push @{$svcs{$1}}, $2;
+		}
+		for my $svc (keys %svcs) {
+			$proto_str .= "\n";
+			$proto_str .= "service $svc {\n";
+			for my $method (@{$svcs{$svc}}) {
+				$proto_str .= "   rpc $method(TODO) returns (TODO) {}\n";
 			}
-			for my $svc (keys %svcs) {
-				$proto_str .= "service $svc {\n";
-				for my $method (@{$svcs{$svc}}) {
-					$proto_str .= "   rpc $method(TODO) returns (TODO) {}\n";
-				}
-				$proto_str .= "}\n";
-			}
+			$proto_str .= "}\n";
 		}
 
 		$re{$basename} = $proto_str;
@@ -143,11 +150,19 @@ message $go_msg_type {
 
 sub disassemble_binary {
 	my $gobin_path = shift;
+	my $destdir_path = shift;
+	
+	my $n = basename($gobin_path);
+	my $disasm_path = "$destdir_path/$n.disasm";
+	if (!-s $disasm_path) {
+		system("objdump --disassemble '$gobin_path' > $disasm_path");
+	}
 	
 	my %re;
 	# this is how a symbol definition starts:
 	# 00000000004433c0 <runtime.getStackMap>:
-	open my $cmd,'-|',"objdump --disassemble '$gobin_path'" or die $@;
+	
+	open (my $cmd, "<$disasm_path") or die "Unable to open $disasm_path: $!";
 	my $line;
 	my $go_msg_type;
 	my $go_field_name;
@@ -296,7 +311,11 @@ sub parse_gdb_functions_for_proto {
 		my $is_rpc = $2 ? 1 : 0;
 		
 		$re{$proto_basename}{"path"} = $f;
-		if(($f =~ m#pkg/mod/(.+?)@(.+?)/(.+)#)||($f =~ m#go/src/(.+?)(?:@(.+?))?/(.+)#)) {
+		# should work with:
+		# /root/go/pkg/mod/google.golang.org/grpc/examples@v0.0.0-20200605192255-479df5ea818c/features/proto/echo/echo.pb.go
+		# /root/go/src/github.com/irsl/sth/test-nested.pb.go
+		# blaze-out/k8-opt/genfiles/google/api/annotations.pb.go
+		if(($f =~ m#pkg/mod/(.+?)@(.+?)/(.+)#)||($f =~ m#go/src/(.+?)(?:@(.+?))?/(.+)#)||($f =~ m#/genfiles/(.+?)/(foobar/)?(.+)#)) {
 			$re{$proto_basename}{"repo"}{"shortname"} = $1;
 			$re{$proto_basename}{"repo"}{"version"} = $2 || "";
 			$re{$proto_basename}{"repo"}{"longname"} = $1.'@'.$re{$proto_basename}{"repo"}{"version"};

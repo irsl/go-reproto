@@ -14,8 +14,13 @@ die "Destination directory $destdir_path must exist" if(!-d $destdir_path);
 my $gdb_functions = build_gdb_functions($gobin_path, $destdir_path);
 my $proto_functions = parse_gdb_functions_for_proto($gdb_functions);
 
+fix_services($proto_functions);
+
 #print Dumper($proto_functions); exit;
 my $gobin_buf = read_gobin($gobin_path);
+
+identify_packages($gobin_buf, $proto_functions);
+
 my $proto_msgs = parse_gobin_for_proto_messages($gobin_buf);
 # print Dumper($proto_msgs); exit;
 my $proto_oneofs = parse_gobin_for_oneof_messages($gobin_buf);
@@ -27,6 +32,58 @@ my $type_hints = disassemble_binary($gobin_path, $destdir_path);
 my $protos = reconstruct_protos($proto_functions, $proto_msgs, $proto_oneofs, $type_hints);
 #print Dumper($protos);
 save_protos($destdir_path, $protos);
+
+sub identify_packages {
+	my ($gobin_buf, $proto_functions) = @_;
+	
+	for my $basename (keys %$proto_functions) {
+		my $pf = $proto_functions->{$basename};
+		
+		my %svcs = %{$pf->{fixed_svcs}};
+		for my $svc (keys %svcs) {
+			# a method invocation needs submitting an HTTP request to this path:
+			# /grpc.examples.echo.Echo/BidirectionalStreamingEcho
+			# this string is present in the binary, lets find it.
+			
+			my %packages;
+			for my $method (@{$svcs{$svc}}) {
+
+				while($gobin_buf =~ m#/([a-zA-Z0-9\.]+?)\.$svc/$method#sg) {
+					$packages{$1} = 1;
+				}				
+			}
+			
+			my @packages_arr = keys %packages;
+			$pf->{packages} = \@packages_arr;
+		}
+	}
+}
+
+sub fix_services {
+	my ($proto_functions) = @_;
+	
+	# each service method gets a _Handler defined, like:
+	# void google.golang.org/grpc/examples/features/proto/echo._Echo_BidirectionalStreamingEcho_Handler(interface {}, google.golang.org/grpc.ServerStream, error);
+	# in this example, the name of the service is Echo
+	
+	# Another symbol name that should be identified:
+	# void google3/cloud/build/proto/worker/worker_go_proto._Worker_BuildLog_Handler(context.Context, interface {}, google3/net/rpc/go/rpc.Stream, error);
+
+	for my $basename (keys %$proto_functions) {
+		my $pf = $proto_functions->{$basename};
+		
+		my %svcs;
+
+		# in some cases, the grpc service definitions are part of the main pg.go file, so we process both msg and rpc
+		my @allsymbols = (@{$pf->{msg} || []}, @{$pf->{rpc} || []});
+		for my $symbol (@allsymbols) {
+			next if($symbol !~ /.+\._([a-zA-Z0-9]+)_(.+)_Handler\(/);
+			push @{$svcs{$1}}, $2;
+		}
+		
+		$pf->{"fixed_svcs"} = \%svcs;
+	}
+}
 
 sub reconstruct_protos {
 	my ($proto_functions, $proto_msgs, $proto_oneofs, $type_hints) = @_;
@@ -41,6 +98,13 @@ syntax = \"proto3\";
 option go_package = \"$pf->{repo}->{shortname}/$pf->{repo}->{relpath_to_dir}\";
 
 ";
+		my @packages = @{$pf->{packages} || []};
+		if(scalar @packages > 1) {
+			$proto_str .= "// TODO: multiple matching packages\n";
+		}
+		for my $package (@packages) {
+			$proto_str .= "package $package;\n";
+		}
 
 		if($proto_functions->{$basename}->{msg}) {
 
@@ -118,22 +182,9 @@ message $go_msg_type {
 			}
 		}
 		
-		# each service method gets a _Handler defined, like:
-		# void google.golang.org/grpc/examples/features/proto/echo._Echo_BidirectionalStreamingEcho_Handler(interface {}, google.golang.org/grpc.ServerStream, error);
-		# in this example, the name of the service is Echo
-		
-		# Another symbol name that should be identified:
-		# void google3/cloud/build/proto/worker/worker_go_proto._Worker_BuildLog_Handler(context.Context, interface {}, google3/net/rpc/go/rpc.Stream, error);
 
 
-		my %svcs;
-
-		# in some cases, the grpc service definitions are part of the main pg.go file, so we process both msg and rpc
-		my @allsymbols = (@{$proto_functions->{$basename}->{msg} || []}, @{$proto_functions->{$basename}->{rpc} || []});
-		for my $symbol (@allsymbols) {
-			next if($symbol !~ /.+\._([a-zA-Z0-9]+)_(.+)_Handler\(/);
-			push @{$svcs{$1}}, $2;
-		}
+		my %svcs = %{$pf->{fixed_svcs}};
 		for my $svc (keys %svcs) {
 			$proto_str .= "\n";
 			$proto_str .= "service $svc {\n";

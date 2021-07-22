@@ -67,22 +67,24 @@ syntax = "proto3";
 
 option go_package = "google.golang.org/grpc/examples/features/proto/echo";
 
+package grpc.examples.echo;
 
 message EchoRequest {
-        // TODO: Message has multiple definitions!
-        string message = 8;
-        string message = 1;
-        string message = 2;
+ // TODO: Message has multiple definitions!
+ string message = 8;
+ string message = 1;
+ string message = 2;
 
 }
 
 message EchoResponse {
-        // TODO: Message has multiple definitions!
-        string message = 8;
-        string message = 1;
-        string message = 2;
+ // TODO: Message has multiple definitions!
+ string message = 8;
+ string message = 1;
+ string message = 2;
 
 }
+
 service Echo {
    rpc BidirectionalStreamingEcho(TODO) returns (TODO) {}
    rpc ClientStreamingEcho(TODO) returns (TODO) {}

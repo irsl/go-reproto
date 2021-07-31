@@ -26,10 +26,12 @@ my $proto_msgs = parse_gobin_for_proto_messages($gobin_buf);
 my $proto_oneofs = parse_gobin_for_oneof_messages($gobin_buf);
 #print Dumper($proto_oneofs);exit;
 
+my $enums_per_message = find_enum_definitions($gobin_buf, $proto_msgs);
+
 my $type_hints = disassemble_binary($gobin_path, $destdir_path);
 # print Dumper($type_hints); exit;
 
-my $protos = reconstruct_protos($proto_functions, $proto_msgs, $proto_oneofs, $type_hints);
+my $protos = reconstruct_protos($proto_functions, $proto_msgs, $proto_oneofs, $type_hints, $enums_per_message);
 #print Dumper($protos);
 save_protos($destdir_path, $protos);
 
@@ -85,8 +87,63 @@ sub fix_services {
 	}
 }
 
+sub find_enum_definitions {
+	my ($gobin_buf, $proto_msgs) = @_;
+	
+	my %re;
+	for my $go_field_name (keys %$proto_msgs) {
+		my $attrs_arr = $proto_msgs->{$go_field_name};
+		for my $attrs (@$attrs_arr) {
+			my $enum_full_name = $attrs->{enum}; # eg. SearchRequest_Corpus
+			next if(!$enum_full_name);
+			next if($enum_full_name !~ /(.+)_(.+)/);
+			my $msg_name = $1;
+			my $go_name = $2;
+			my $json_name = $attrs->{name}; # e.g. corpus
+			my $ed = find_enum_definition($gobin_buf, $msg_name, $go_name, $json_name);
+			if(!$ed) {
+				warn "Enum definition for $msg_name.$go_name not found!";
+				next;
+			}
+			$re{$msg_name}{$go_name} = {
+				"enum_type_name"=> $go_name,
+				"defs"=> $ed,
+				"annotation"=> $attrs,
+			};
+			
+		}
+	}
+	return \%re;
+}
+
+sub find_enum_definition {
+	my ($gobin_buf, $msg_name, $enum_name_go, $enum_name_js) = @_;
+
+	if($gobin_buf !~ /\Q$msg_name\E.\Q$enum_name_go\E..\Q$enum_name_js\E....\Q$enum_name_go\E.../s) {
+		return;
+	}
+	
+	my $current_pos = $+[0]; # this is the position of the first character after the last match
+	my %re;
+	while(1) {
+		my $l = ord(substr($gobin_buf, $current_pos, 1));
+		last if $l <= 0;
+		$current_pos++;
+		my $name = substr($gobin_buf, $current_pos, $l);
+		last if($name !~ /^[a-zA-Z0-9_]+$/);
+		$current_pos+=$l;
+		last if ord(substr($gobin_buf, $current_pos, 1)) != 0x10;
+		$current_pos++;
+		my $value = ord(substr($gobin_buf, $current_pos, 1));
+		$re{$name} = $value;
+		$current_pos+= 4;
+	}
+	
+	return \%re;
+}
+
 sub reconstruct_protos {
-	my ($proto_functions, $proto_msgs, $proto_oneofs, $type_hints) = @_;
+	my ($proto_functions, $proto_msgs, $proto_oneofs, $type_hints, $enums_per_message) = @_;
 	my %re;
 	for my $basename (keys %$proto_functions) {
 		my $pf = $proto_functions->{$basename};
@@ -150,6 +207,21 @@ message $go_msg_type {
 					if($oneof_name ne "") {
 						$proto_str .= "   oneof $oneof_name {\n"
 					}
+					
+					for my $enum_field_name (keys %{$enums_per_message->{$go_msg_type}}) {
+						my $e = $enums_per_message->{$go_msg_type}->{$enum_field_name};
+						$proto_str .= "
+  enum $e->{enum_type_name} {
+";
+						for my $enum_def_name (keys %{$e->{defs}}) {
+							my $v = $e->{defs}->{$enum_def_name};
+							$proto_str .= "     $enum_def_name = $v;\n";
+						}
+						$proto_str .= "
+  }
+";
+						push @{$oneof_names{$go_msg_type}{$oneof_name}}, $e->{enum_type_name};
+					}
 
 					for my $go_field_name (@{$oneof_names{$go_msg_type}{$oneof_name}}) {
 						my $msgs = $proto_msgs->{$go_field_name};
@@ -164,7 +236,7 @@ message $go_msg_type {
 							if(defined $msg->{rep}) {
 								$flagprefix = "repeated ";
 							}
-							fix_up_proto_type($go_msg_type, $go_field_name, $msg, $type_hints);
+							fix_up_proto_type($go_msg_type, $go_field_name, $msg, $type_hints, $enums_per_message);
 							$proto_str .= "	$flagprefix$msg->{type} $msg->{name} = $msg->{tag};$msg->{remarks}\n";
 						}
 					}
@@ -254,6 +326,7 @@ sub fix_up_proto_type {
 	my $golang_field_name = shift;
 	my $proto_msg = shift;
 	my $type_hints = shift;
+	my $enums_per_message = shift;
 	
 	if($proto_msg->{type} eq "bytes") {
 		my $type_hint = $type_hints->{$go_msg_type}{$golang_field_name};
@@ -263,7 +336,12 @@ sub fix_up_proto_type {
 			$proto_msg->{remarks} .= " // TODO: may be string or another proto message";
 		}
 	} elsif($proto_msg->{type} eq "varint") {
-	    $proto_msg->{type} = "int32";
+		if(($enums_per_message->{$go_msg_type})&&($enums_per_message->{$go_msg_type}->{$golang_field_name})) {
+			# it is an enum!
+			$proto_msg->{type} = $enums_per_message->{$go_msg_type}->{$golang_field_name}->{enum_type_name};			
+		} else {
+			$proto_msg->{type} = "int32";
+		}
 	}
 }
 
@@ -294,7 +372,7 @@ sub parse_gobin_for_proto_messages {
 
     my %re;
 	while($buf =~ /([a-zA-Z0-9_]+)\x00.protobuf:"(.+?)"/sg) {
-		#print "found: $1, $2\n";
+		# print "found: $1, $2\n";
 		my ($go_field_name, $go_proto_annotation) = ($1, $2);
 		my $proto_attrs = parse_proto_annotation($go_proto_annotation);
 		#print Dumper($proto_attrs);
